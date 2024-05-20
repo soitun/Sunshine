@@ -1,26 +1,14 @@
 Localization
 ============
-Sunshine is being localized into various languages. The default language is `en` (English) and is highlighted green.
+Sunshine and related LizardByte projects are being localized into various languages. The default language is
+`en` (English).
 
-.. image:: https://img.shields.io/badge/dynamic/json?color=blue&label=de&style=for-the-badge&query=%24.progress.0.data.translationProgress&url=https%3A%2F%2Fbadges.awesome-crowdin.com%2Fstats-15178612-503956.json
-.. image:: https://img.shields.io/badge/dynamic/json?color=green&label=en&style=for-the-badge&query=%24.progress.1.data.translationProgress&url=https%3A%2F%2Fbadges.awesome-crowdin.com%2Fstats-15178612-503956.json
-.. image:: https://img.shields.io/badge/dynamic/json?color=blue&label=en-GB&style=for-the-badge&query=%24.progress.2.data.translationProgress&url=https%3A%2F%2Fbadges.awesome-crowdin.com%2Fstats-15178612-503956.json
-.. image:: https://img.shields.io/badge/dynamic/json?color=blue&label=en-US&style=for-the-badge&query=%24.progress.3.data.translationProgress&url=https%3A%2F%2Fbadges.awesome-crowdin.com%2Fstats-15178612-503956.json
-.. image:: https://img.shields.io/badge/dynamic/json?color=blue&label=es-ES&style=for-the-badge&query=%24.progress.4.data.translationProgress&url=https%3A%2F%2Fbadges.awesome-crowdin.com%2Fstats-15178612-503956.json
-.. image:: https://img.shields.io/badge/dynamic/json?color=blue&label=fr&style=for-the-badge&query=%24.progress.5.data.translationProgress&url=https%3A%2F%2Fbadges.awesome-crowdin.com%2Fstats-15178612-503956.json
-.. image:: https://img.shields.io/badge/dynamic/json?color=blue&label=it&style=for-the-badge&query=%24.progress.6.data.translationProgress&url=https%3A%2F%2Fbadges.awesome-crowdin.com%2Fstats-15178612-503956.json
-.. image:: https://img.shields.io/badge/dynamic/json?color=blue&label=ru&style=for-the-badge&query=%24.progress.7.data.translationProgress&url=https%3A%2F%2Fbadges.awesome-crowdin.com%2Fstats-15178612-503956.json
-
-Graph
-   .. image:: https://badges.awesome-crowdin.com/translation-15178612-503956.png
+ .. image:: https://app.lizardbyte.dev/uno/crowdin/LizardByte_graph.svg
 
 CrowdIn
 -------
-The translations occur on
-`CrowdIn <https://crowdin.com/project/sunshinestream>`_. Feel free to contribute to localization there.
-Only elements of the API are planned to be translated.
-
-.. Attention:: The rest API has not yet been implemented.
+The translations occur on `CrowdIn <https://translate.lizardbyte.dev/>`__. Anyone is free to contribute to
+localization there.
 
 **Translations Basics**
    - The brand names `LizardByte` and `Sunshine` should never be translated.
@@ -42,40 +30,84 @@ Only elements of the API are planned to be translated.
 
 Extraction
 ----------
-There should be minimal cases where strings need to be extracted from source code; however it may be necessary in some
-situations. For example if a system tray icon is added it should be localized as it is user interfacing.
 
-- Wrap the string to be extracted in a function as shown.
-   .. code-block:: cpp
+.. tab:: UI
 
-      #include <boost/locale.hpp>
-      boost::locale::translate("Hello world!")
+   Sunshine uses `Vue I18n <https://vue-i18n.intlify.dev/>`__ for localizing the UI.
+   The following is a simple example of how to use it.
 
-.. Tip:: More examples can be found in the documentation for
-   `boost locale <https://www.boost.org/doc/libs/1_70_0/libs/locale/doc/html/messages_formatting.html>`_.
+   - Add the string to `src_assets/common/assets/web/public/assets/locale/en.json`, in English.
+      .. code-block:: json
 
-.. Warning:: This is for information only. Contributors should never include manually updated template files, or
-   manually compiled language files in Pull Requests.
+         {
+           "index": {
+             "welcome": "Hello, Sunshine!"
+           }
+         }
 
-Strings are automatically extracted from the code to the `locale/sunshine.po` template file. The generated file is
-used by CrowdIn to generate language specific template files. The file is generated using the
-`.github/workflows/localize.yml` workflow and is run on any push event into the `nightly` branch. Jobs are only run if
-any of the following paths are modified.
+      .. note:: The json keys should be sorted alphabetically. You can use `jsonabc <https://novicelab.org/jsonabc/>`__
+         to sort the keys.
 
-.. code-block:: yaml
+      .. attention:: Due to the integration with Crowdin, it is important to only add strings to the `en.json` file,
+         and to not modify any other language files. After the PR is merged, the translations can take place
+         on `CrowdIn <https://translate.lizardbyte.dev/>`__. Once the translations are complete, a PR will be made
+         to merge the translations into Sunshine.
 
-   - 'src/**'
+   - Use the string in a Vue component.
+      .. code-block:: html
 
-When testing locally it may be desirable to manually extract, initialize, update, and compile strings. Python is
-required for this, along with the python dependencies in the `./scripts/requirements.txt` file. Additionally,
-`xgettext <https://www.gnu.org/software/gettext/>`_ must be installed.
+         <template>
+           <div>
+             <p>{{ $t('index.welcome') }}</p>
+           </div>
+         </template>
 
-**Extract, initialize, and update**
-   .. code-block:: bash
+   .. tip:: More formatting examples can be found in the
+      `Vue I18n guide <https://kazupon.github.io/vue-i18n/guide/formatting.html>`__.
 
-      python ./scripts/_locale.py --extract --init --update
+.. tab:: C++
 
-**Compile**
-   .. code-block:: bash
+   There should be minimal cases where strings need to be extracted from C++ source code; however it may be necessary in
+   some situations. For example the system tray icon could be localized as it is user interfacing.
 
-      python ./scripts/_locale.py --compile
+   - Wrap the string to be extracted in a function as shown.
+      .. code-block:: cpp
+
+         #include <boost/locale.hpp>
+         #include <string>
+
+         std::string msg = boost::locale::translate("Hello world!");
+
+   .. tip:: More examples can be found in the documentation for
+      `boost locale <https://www.boost.org/doc/libs/1_70_0/libs/locale/doc/html/messages_formatting.html>`__.
+
+   .. warning:: This is for information only. Contributors should never include manually updated template files, or
+      manually compiled language files in Pull Requests.
+
+   Strings are automatically extracted from the code to the `locale/sunshine.po` template file. The generated file is
+   used by CrowdIn to generate language specific template files. The file is generated using the
+   `.github/workflows/localize.yml` workflow and is run on any push event into the `nightly` branch. Jobs are only run if
+   any of the following paths are modified.
+
+   .. code-block:: yaml
+
+      - 'src/**'
+
+   When testing locally it may be desirable to manually extract, initialize, update, and compile strings. Python is
+   required for this, along with the python dependencies in the `./scripts/requirements.txt` file. Additionally,
+   `xgettext <https://www.gnu.org/software/gettext/>`__ must be installed.
+
+   **Extract, initialize, and update**
+      .. code-block:: bash
+
+         python ./scripts/_locale.py --extract --init --update
+
+   **Compile**
+      .. code-block:: bash
+
+         python ./scripts/_locale.py --compile
+
+   .. attention:: Due to the integration with Crowdin, it is important to not include any extracted or compiled files in
+      Pull Requests. The files are automatically generated and updated by the workflow. Once the PR is merged, the
+      translations can take place on `CrowdIn <https://translate.lizardbyte.dev/>`__. Once the translations are
+      complete, a PR will be made to merge the translations into Sunshine.

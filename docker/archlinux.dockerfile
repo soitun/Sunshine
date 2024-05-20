@@ -2,7 +2,7 @@
 # artifacts: true
 # platforms: linux/amd64
 # archlinux does not have an arm64 base image
-# no-cache-filters: sunshine-base,artifacts,sunshine
+# no-cache-filters: artifacts,sunshine
 ARG BASE=archlinux
 ARG TAG=base-devel
 FROM ${BASE}:${TAG} AS sunshine-base
@@ -11,7 +11,7 @@ FROM ${BASE}:${TAG} AS sunshine-base
 RUN <<_DEPS
 #!/bin/bash
 set -e
-pacman -Syu --noconfirm \
+pacman -Syu --disable-download-timeout --needed --noconfirm \
   archlinux-keyring
 _DEPS
 
@@ -22,24 +22,29 @@ RUN useradd -m builder && \
 
 FROM sunshine-base as sunshine-build
 
+ARG BRANCH
 ARG BUILD_VERSION
 ARG COMMIT
 ARG CLONE_URL
 # note: BUILD_VERSION may be blank
 
+ENV BRANCH=${BRANCH}
+ENV BUILD_VERSION=${BUILD_VERSION}
+ENV COMMIT=${COMMIT}
+
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # install dependencies
-# cuda, libcap, and libdrm are optional dependencies for PKGBUILD
+# cuda is an optional build-time dependency for PKGBUILD
 RUN <<_DEPS
 #!/bin/bash
 set -e
-pacman -Syu --noconfirm \
+pacman -Syu --disable-download-timeout --needed --noconfirm \
   base-devel \
   cmake \
   cuda \
-  libcap \
-  libdrm \
-  namcap
+  git \
+  namcap \
+  xorg-server-xvfb
 _DEPS
 
 # Setup builder user
@@ -62,9 +67,11 @@ else
   sub_version=""
 fi
 cmake \
-  -DSUNSHINE_CONFIGURE_AUR=ON \
+  -DSUNSHINE_CONFIGURE_PKGBUILD=ON \
   -DSUNSHINE_SUB_VERSION="${sub_version}" \
   -DGITHUB_CLONE_URL="${CLONE_URL}" \
+  -DGITHUB_BRANCH=${BRANCH} \
+  -DGITHUB_BUILD_VERSION=${BUILD_VERSION} \
   -DGITHUB_COMMIT="${COMMIT}" \
   -DSUNSHINE_CONFIGURE_ONLY=ON \
   /build/sunshine
@@ -72,19 +79,22 @@ _MAKE
 
 WORKDIR /build/sunshine/pkg
 RUN mv /build/sunshine/build/PKGBUILD .
+RUN mv /build/sunshine/build/sunshine.install .
 
 # namcap and build PKGBUILD file
 RUN <<_PKGBUILD
 #!/bin/bash
 set -e
+export DISPLAY=:1
+Xvfb ${DISPLAY} -screen 0 1024x768x24 &
 namcap -i PKGBUILD
 makepkg -si --noconfirm
+rm -f /build/sunshine/pkg/sunshine-debug*.pkg.tar.zst
 ls -a
 _PKGBUILD
 
 FROM scratch as artifacts
 
-COPY --link --from=sunshine-build /build/sunshine/pkg/PKGBUILD /PKGBUILD
 COPY --link --from=sunshine-build /build/sunshine/pkg/sunshine*.pkg.tar.zst /sunshine.pkg.tar.zst
 
 FROM sunshine-base as sunshine
@@ -96,7 +106,10 @@ COPY --link --from=artifacts /sunshine.pkg.tar.zst /
 RUN <<_INSTALL_SUNSHINE
 #!/bin/bash
 set -e
-pacman -U --noconfirm \
+# update keyring to prevent cached keyring errors
+pacman -Syu --disable-download-timeout --needed --noconfirm \
+  archlinux-keyring
+pacman -U --disable-download-timeout --needed --noconfirm \
   /sunshine.pkg.tar.zst
 _INSTALL_SUNSHINE
 
@@ -125,7 +138,7 @@ userdel -r builder
 
 # then create the lizard user
 groupadd -f -g "${PGID}" "${UNAME}"
-useradd -lm -d ${HOME} -s /bin/bash -g "${PGID}" -G input -u "${PUID}" "${UNAME}"
+useradd -lm -d ${HOME} -s /bin/bash -g "${PGID}" -u "${PUID}" "${UNAME}"
 mkdir -p ${HOME}/.config/sunshine
 ln -s ${HOME}/.config/sunshine /config
 chown -R ${UNAME} ${HOME}

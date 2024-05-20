@@ -1,28 +1,52 @@
-// Created by loki on 2/2/20.
-
-#ifndef SUNSHINE_RTSP_H
-#define SUNSHINE_RTSP_H
+/**
+ * @file src/rtsp.h
+ * @brief todo
+ */
+#pragma once
 
 #include <atomic>
 
 #include "crypto.h"
 #include "thread_safe.h"
 
-namespace stream {
-constexpr auto RTSP_SETUP_PORT = 21;
+namespace rtsp_stream {
+  constexpr auto RTSP_SETUP_PORT = 21;
 
-struct launch_session_t {
-  crypto::aes_t gcm_key;
-  crypto::aes_t iv;
+  struct launch_session_t {
+    uint32_t id;
 
-  bool host_audio;
-};
+    crypto::aes_t gcm_key;
+    crypto::aes_t iv;
 
-void launch_session_raise(launch_session_t launch_session);
-int session_count();
+    std::string av_ping_payload;
+    uint32_t control_connect_data;
 
-void rtpThread();
+    bool host_audio;
+    std::string unique_id;
+    int width;
+    int height;
+    int fps;
+    int gcmap;
+    int appid;
+    int surround_info;
+    bool enable_hdr;
+    bool enable_sops;
 
-} // namespace stream
+    std::optional<crypto::cipher::gcm_t> rtsp_cipher;
+    std::string rtsp_url_scheme;
+    uint32_t rtsp_iv_counter;
+  };
 
-#endif // SUNSHINE_RTSP_H
+  void
+  launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+
+  void
+  launch_session_clear(uint32_t launch_session_id);
+
+  int
+  session_count();
+
+  void
+  rtpThread();
+
+}  // namespace rtsp_stream
