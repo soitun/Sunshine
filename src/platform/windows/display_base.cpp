@@ -17,7 +17,6 @@ typedef long NTSTATUS;
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
-#include "src/stat_trackers.h"
 #include "src/video.h"
 
 namespace platf {
@@ -182,27 +181,6 @@ namespace platf::dxgi {
     release_frame();
   }
 
-  void
-  display_base_t::high_precision_sleep(std::chrono::nanoseconds duration) {
-    if (!timer) {
-      BOOST_LOG(error) << "Attempting high_precision_sleep() with uninitialized timer";
-      return;
-    }
-    if (duration < 0s) {
-      BOOST_LOG(error) << "Attempting high_precision_sleep() with negative duration";
-      return;
-    }
-    if (duration > 5s) {
-      BOOST_LOG(error) << "Attempting high_precision_sleep() with unexpectedly large duration (>5s)";
-      return;
-    }
-
-    LARGE_INTEGER due_time;
-    due_time.QuadPart = duration.count() / -100;
-    SetWaitableTimer(timer.get(), &due_time, 0, nullptr, nullptr, false);
-    WaitForSingleObject(timer.get(), INFINITE);
-  }
-
   capture_e
   display_base_t::capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) {
     auto adjust_client_frame_rate = [&]() -> DXGI_RATIONAL {
@@ -239,7 +217,7 @@ namespace platf::dxgi {
       SetThreadExecutionState(ES_CONTINUOUS);
     });
 
-    sleep_overshoot_tracker.reset();
+    sleep_overshoot_logger.reset();
 
     while (true) {
       // This will return false if the HDR state changes or for any number of other
@@ -268,9 +246,9 @@ namespace platf::dxgi {
           status = capture_e::timeout;
         }
         else {
-          high_precision_sleep(sleep_period);
-          std::chrono::nanoseconds overshoot_ns = std::chrono::steady_clock::now() - sleep_target;
-          log_sleep_overshoot(overshoot_ns);
+          timer->sleep_for(sleep_period);
+          sleep_overshoot_logger.first_point(sleep_target);
+          sleep_overshoot_logger.second_point_now_and_log();
 
           status = snapshot(pull_free_image_cb, img_out, 0ms, *cursor);
 
@@ -591,6 +569,8 @@ namespace platf::dxgi {
             // Ensure offset starts at 0x0
             offset_x -= GetSystemMetrics(SM_XVIRTUALSCREEN);
             offset_y -= GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+            break;
           }
         }
 
@@ -799,15 +779,9 @@ namespace platf::dxgi {
         << "Max Full Luminance : "sv << desc1.MaxFullFrameLuminance << " nits"sv;
     }
 
-    // Use CREATE_WAITABLE_TIMER_HIGH_RESOLUTION if supported (Windows 10 1809+)
-    timer.reset(CreateWaitableTimerEx(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS));
-    if (!timer) {
-      timer.reset(CreateWaitableTimerEx(nullptr, nullptr, 0, TIMER_ALL_ACCESS));
-      if (!timer) {
-        auto winerr = GetLastError();
-        BOOST_LOG(error) << "Failed to create timer: "sv << winerr;
-        return -1;
-      }
+    if (!timer || !*timer) {
+      BOOST_LOG(error) << "Uninitialized high precision timer";
+      return -1;
     }
 
     return 0;

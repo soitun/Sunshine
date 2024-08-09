@@ -61,6 +61,38 @@
   #define WLAN_API_MAKE_VERSION(_major, _minor) (((DWORD) (_minor)) << 16 | (_major))
 #endif
 
+#include <winternl.h>
+extern "C" {
+NTSTATUS NTAPI
+NtSetTimerResolution(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
+}
+
+namespace {
+
+  std::atomic<bool> used_nt_set_timer_resolution = false;
+
+  bool
+  nt_set_timer_resolution_max() {
+    ULONG minimum, maximum, current;
+    if (!NT_SUCCESS(NtQueryTimerResolution(&minimum, &maximum, &current)) ||
+        !NT_SUCCESS(NtSetTimerResolution(maximum, TRUE, &current))) {
+      return false;
+    }
+    return true;
+  }
+
+  bool
+  nt_set_timer_resolution_min() {
+    ULONG minimum, maximum, current;
+    if (!NT_SUCCESS(NtQueryTimerResolution(&minimum, &maximum, &current)) ||
+        !NT_SUCCESS(NtSetTimerResolution(minimum, TRUE, &current))) {
+      return false;
+    }
+    return true;
+  }
+
+}  // namespace
+
 namespace bp = boost::process;
 
 using namespace std::literals;
@@ -1115,8 +1147,15 @@ namespace platf {
     // Enable MMCSS scheduling for DWM
     DwmEnableMMCSS(true);
 
-    // Reduce timer period to 1ms
-    timeBeginPeriod(1);
+    // Reduce timer period to 0.5ms
+    if (nt_set_timer_resolution_max()) {
+      used_nt_set_timer_resolution = true;
+    }
+    else {
+      BOOST_LOG(error) << "NtSetTimerResolution() failed, falling back to timeBeginPeriod()";
+      timeBeginPeriod(1);
+      used_nt_set_timer_resolution = false;
+    }
 
     // Promote ourselves to high priority class
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
@@ -1199,8 +1238,16 @@ namespace platf {
     // Demote ourselves back to normal priority class
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
-    // End our 1ms timer request
-    timeEndPeriod(1);
+    // End our 0.5ms timer request
+    if (used_nt_set_timer_resolution) {
+      used_nt_set_timer_resolution = false;
+      if (!nt_set_timer_resolution_min()) {
+        BOOST_LOG(error) << "nt_set_timer_resolution_min() failed even though nt_set_timer_resolution_max() succeeded";
+      }
+    }
+    else {
+      timeEndPeriod(1);
+    }
 
     // Disable MMCSS scheduling for DWM
     DwmEnableMMCSS(false);
@@ -1405,12 +1452,37 @@ namespace platf {
       msg.namelen = sizeof(taddr_v4);
     }
 
-    WSABUF buf;
-    buf.buf = (char *) send_info.buffer;
-    buf.len = send_info.block_size * send_info.block_count;
+    auto const max_bufs_per_msg = send_info.payload_buffers.size() + (send_info.headers ? 1 : 0);
 
-    msg.lpBuffers = &buf;
-    msg.dwBufferCount = 1;
+    WSABUF bufs[(send_info.headers ? send_info.block_count : 1) * max_bufs_per_msg];
+    DWORD bufcount = 0;
+    if (send_info.headers) {
+      // Interleave buffers for headers and payloads
+      for (auto i = 0; i < send_info.block_count; i++) {
+        bufs[bufcount].buf = (char *) &send_info.headers[(send_info.block_offset + i) * send_info.header_size];
+        bufs[bufcount].len = send_info.header_size;
+        bufcount++;
+        auto payload_desc = send_info.buffer_for_payload_offset((send_info.block_offset + i) * send_info.payload_size);
+        bufs[bufcount].buf = (char *) payload_desc.buffer;
+        bufs[bufcount].len = send_info.payload_size;
+        bufcount++;
+      }
+    }
+    else {
+      // Translate buffer descriptors into WSABUFs
+      auto payload_offset = send_info.block_offset * send_info.payload_size;
+      auto payload_length = payload_offset + (send_info.block_count * send_info.payload_size);
+      while (payload_offset < payload_length) {
+        auto payload_desc = send_info.buffer_for_payload_offset(payload_offset);
+        bufs[bufcount].buf = (char *) payload_desc.buffer;
+        bufs[bufcount].len = std::min(payload_desc.size, payload_length - payload_offset);
+        payload_offset += bufs[bufcount].len;
+        bufcount++;
+      }
+    }
+
+    msg.lpBuffers = bufs;
+    msg.dwBufferCount = bufcount;
     msg.dwFlags = 0;
 
     // At most, one DWORD option and one PKTINFO option
@@ -1458,14 +1530,14 @@ namespace platf {
       cm->cmsg_level = IPPROTO_UDP;
       cm->cmsg_type = UDP_SEND_MSG_SIZE;
       cm->cmsg_len = WSA_CMSG_LEN(sizeof(DWORD));
-      *((DWORD *) WSA_CMSG_DATA(cm)) = send_info.block_size;
+      *((DWORD *) WSA_CMSG_DATA(cm)) = send_info.header_size + send_info.payload_size;
     }
 
     msg.Control.len = cmbuflen;
 
     // If USO is not supported, this will fail and the caller will fall back to unbatched sends.
     DWORD bytes_sent;
-    return WSASendMsg((SOCKET) send_info.native_socket, &msg, 1, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR;
+    return WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) != SOCKET_ERROR;
   }
 
   bool
@@ -1488,12 +1560,19 @@ namespace platf {
       msg.namelen = sizeof(taddr_v4);
     }
 
-    WSABUF buf;
-    buf.buf = (char *) send_info.buffer;
-    buf.len = send_info.size;
+    WSABUF bufs[2];
+    DWORD bufcount = 0;
+    if (send_info.header) {
+      bufs[bufcount].buf = (char *) send_info.header;
+      bufs[bufcount].len = send_info.header_size;
+      bufcount++;
+    }
+    bufs[bufcount].buf = (char *) send_info.payload;
+    bufs[bufcount].len = send_info.payload_size;
+    bufcount++;
 
-    msg.lpBuffers = &buf;
-    msg.dwBufferCount = 1;
+    msg.lpBuffers = bufs;
+    msg.dwBufferCount = bufcount;
     msg.dwFlags = 0;
 
     char cmbuf[std::max(WSA_CMSG_SPACE(sizeof(IN6_PKTINFO)), WSA_CMSG_SPACE(sizeof(IN_PKTINFO)))] = {};
@@ -1535,7 +1614,7 @@ namespace platf {
     msg.Control.len = cmbuflen;
 
     DWORD bytes_sent;
-    if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 1, &bytes_sent, nullptr, nullptr) == SOCKET_ERROR) {
+    if (WSASendMsg((SOCKET) send_info.native_socket, &msg, 0, &bytes_sent, nullptr, nullptr) == SOCKET_ERROR) {
       auto winerr = WSAGetLastError();
       BOOST_LOG(warning) << "WSASendMsg() failed: "sv << winerr;
       return false;
@@ -1755,5 +1834,56 @@ namespace platf {
     }
 
     return output;
+  }
+
+  class win32_high_precision_timer: public high_precision_timer {
+  public:
+    win32_high_precision_timer() {
+      // Use CREATE_WAITABLE_TIMER_HIGH_RESOLUTION if supported (Windows 10 1809+)
+      timer = CreateWaitableTimerEx(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+      if (!timer) {
+        timer = CreateWaitableTimerEx(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        if (!timer) {
+          BOOST_LOG(error) << "Unable to create high_precision_timer, CreateWaitableTimerEx() failed: " << GetLastError();
+        }
+      }
+    }
+
+    ~win32_high_precision_timer() {
+      if (timer) CloseHandle(timer);
+    }
+
+    void
+    sleep_for(const std::chrono::nanoseconds &duration) override {
+      if (!timer) {
+        BOOST_LOG(error) << "Attempting high_precision_timer::sleep_for() with uninitialized timer";
+        return;
+      }
+      if (duration < 0s) {
+        BOOST_LOG(error) << "Attempting high_precision_timer::sleep_for() with negative duration";
+        return;
+      }
+      if (duration > 5s) {
+        BOOST_LOG(error) << "Attempting high_precision_timer::sleep_for() with unexpectedly large duration (>5s)";
+        return;
+      }
+
+      LARGE_INTEGER due_time;
+      due_time.QuadPart = duration.count() / -100;
+      SetWaitableTimer(timer, &due_time, 0, nullptr, nullptr, false);
+      WaitForSingleObject(timer, INFINITE);
+    }
+
+    operator bool() override {
+      return timer != NULL;
+    }
+
+  private:
+    HANDLE timer = NULL;
+  };
+
+  std::unique_ptr<high_precision_timer>
+  create_high_precision_timer() {
+    return std::make_unique<win32_high_precision_timer>();
   }
 }  // namespace platf

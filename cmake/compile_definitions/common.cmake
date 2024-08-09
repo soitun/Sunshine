@@ -6,12 +6,19 @@ list(APPEND SUNSHINE_COMPILE_OPTIONS -Wall -Wno-sign-compare)
 # Werror - treat warnings as errors
 # Wno-maybe-uninitialized/Wno-uninitialized - disable warnings for maybe uninitialized variables
 # Wno-sign-compare - disable warnings for signed/unsigned comparisons
+# Wno-restrict - disable warnings for memory overlap
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # GCC specific compile options
 
     # GCC 12 and higher will complain about maybe-uninitialized
     if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
         list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-maybe-uninitialized)
+
+        # Disable the bogus warning that may prevent compilation (only for GCC 12).
+        # See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105651.
+        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+            list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-restrict)
+        endif()
     endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     # Clang specific compile options
@@ -49,8 +56,6 @@ configure_file("${CMAKE_SOURCE_DIR}/src/version.h.in" version.h @ONLY)
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")  # required for importing version.h
 
 set(SUNSHINE_TARGET_FILES
-        "${CMAKE_SOURCE_DIR}/third-party/nanors/rs.c"
-        "${CMAKE_SOURCE_DIR}/third-party/nanors/rs.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Rtsp.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/RtspParser.c"
@@ -108,6 +113,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/round_robin.h"
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.h"
         "${CMAKE_SOURCE_DIR}/src/stat_trackers.cpp"
+        "${CMAKE_SOURCE_DIR}/src/rswrapper.h"
+        "${CMAKE_SOURCE_DIR}/src/rswrapper.c"
         ${PLATFORM_TARGET_FILES})
 
 if(NOT SUNSHINE_ASSETS_DIR_DEF)

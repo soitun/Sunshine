@@ -13,8 +13,10 @@
 #include <boost/endian/arithmetic.hpp>
 
 extern "C" {
+// clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
-#include <rs.h>
+#include "rswrapper.h"
+// clang-format on
 }
 
 #include "config.h"
@@ -22,12 +24,13 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
-#include "stat_trackers.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+
+#include "platform/common.h"
 
 #define IDX_START_A 0
 #define IDX_START_B 1
@@ -123,22 +126,12 @@ namespace stream {
   };
 
   struct video_packet_enc_prefix_t {
-    video_packet_raw_t *
-    payload() {
-      return (video_packet_raw_t *) (this + 1);
-    }
-
     std::uint8_t iv[12];  // 12-byte IV is ideal for AES-GCM
     std::uint32_t frameNumber;
     std::uint8_t tag[16];
   };
 
-  struct audio_packet_raw_t {
-    uint8_t *
-    payload() {
-      return (uint8_t *) (this + 1);
-    }
-
+  struct audio_packet_t {
     RTP_PACKET rtp;
   };
 
@@ -216,12 +209,7 @@ namespace stream {
     // encrypted control_header_v2 and payload data follow
   } *control_encrypted_p;
 
-  struct audio_fec_packet_raw_t {
-    uint8_t *
-    payload() {
-      return (uint8_t *) (this + 1);
-    }
-
+  struct audio_fec_packet_t {
     RTP_PACKET rtp;
     AUDIO_FEC_HEADER fecHeader;
   };
@@ -234,10 +222,6 @@ namespace stream {
   }
   constexpr std::size_t MAX_AUDIO_PACKET_SIZE = 1400;
 
-  using rh_t = util::safe_ptr<reed_solomon, reed_solomon_release>;
-  using video_packet_t = util::c_ptr<video_packet_raw_t>;
-  using audio_packet_t = util::c_ptr<audio_packet_raw_t>;
-  using audio_fec_packet_t = util::c_ptr<audio_fec_packet_raw_t>;
   using audio_aes_t = std::array<char, round_to_pkcs7_padded(MAX_AUDIO_PACKET_SIZE)>;
 
   using av_session_id_t = std::variant<asio::ip::address, std::string>;  // IP address or SS-Ping-Payload from RTSP handshake
@@ -247,14 +231,14 @@ namespace stream {
   // return bytes written on success
   // return -1 on error
   static inline int
-  encode_audio(bool encrypted, const audio::buffer_t &plaintext, audio_packet_t &destination, crypto::aes_t &iv, crypto::cipher::cbc_t &cbc) {
+  encode_audio(bool encrypted, const audio::buffer_t &plaintext, uint8_t *destination, crypto::aes_t &iv, crypto::cipher::cbc_t &cbc) {
     // If encryption isn't enabled
     if (!encrypted) {
-      std::copy(std::begin(plaintext), std::end(plaintext), destination->payload());
+      std::copy(std::begin(plaintext), std::end(plaintext), destination);
       return plaintext.size();
     }
 
-    return cbc.encrypt(std::string_view { (char *) std::begin(plaintext), plaintext.size() }, destination->payload(), &iv);
+    return cbc.encrypt(std::string_view { (char *) std::begin(plaintext), plaintext.size() }, destination, &iv);
   }
 
   static inline void
@@ -619,7 +603,7 @@ namespace stream {
   }
 
   namespace fec {
-    using rs_t = util::safe_ptr<reed_solomon, reed_solomon_release>;
+    using rs_t = util::safe_ptr<reed_solomon, [](reed_solomon *rs) { reed_solomon_release(rs); }>;
 
     struct fec_t {
       size_t data_shards;
@@ -629,15 +613,19 @@ namespace stream {
       size_t blocksize;
       size_t prefixsize;
       util::buffer_t<char> shards;
+      util::buffer_t<char> headers;
+      util::buffer_t<uint8_t *> shards_p;
+
+      std::vector<platf::buffer_descriptor_t> payload_buffers;
 
       char *
       data(size_t el) {
-        return &shards[(el + 1) * prefixsize + el * blocksize];
+        return (char *) shards_p[el];
       }
 
       char *
       prefix(size_t el) {
-        return &shards[el * (prefixsize + blocksize)];
+        return prefixsize ? &headers[el * prefixsize] : nullptr;
       }
 
       size_t
@@ -652,11 +640,12 @@ namespace stream {
 
       auto pad = payload_size % blocksize != 0;
 
-      auto data_shards = payload_size / blocksize + (pad ? 1 : 0);
+      auto aligned_data_shards = payload_size / blocksize;
+      auto data_shards = aligned_data_shards + (pad ? 1 : 0);
       auto parity_shards = (data_shards * fecpercentage + 99) / 100;
 
       // increase the FEC percentage for this frame if the parity shard minimum is not met
-      if (parity_shards < minparityshards) {
+      if (parity_shards < minparityshards && fecpercentage != 0) {
         parity_shards = minparityshards;
         fecpercentage = (100 * parity_shards) / data_shards;
 
@@ -664,34 +653,47 @@ namespace stream {
       }
 
       auto nr_shards = data_shards + parity_shards;
-      if (nr_shards > DATA_SHARDS_MAX) {
-        BOOST_LOG(warning)
-          << "Number of fragments for reed solomon exceeds DATA_SHARDS_MAX"sv << std::endl
-          << nr_shards << " > "sv << DATA_SHARDS_MAX
-          << ", skipping error correction"sv;
 
-        nr_shards = data_shards;
-        fecpercentage = 0;
-      }
-
-      util::buffer_t<char> shards { nr_shards * (blocksize + prefixsize) };
+      // If we need to store a zero-padded data shard, allocate that first to
+      // to keep the shards in order and reduce buffer fragmentation
+      auto parity_shard_offset = pad ? 1 : 0;
+      util::buffer_t<char> shards { (parity_shard_offset + parity_shards) * blocksize };
       util::buffer_t<uint8_t *> shards_p { nr_shards };
+      std::vector<platf::buffer_descriptor_t> payload_buffers;
+      payload_buffers.reserve(2);
 
+      // Point into the payload buffer for all except the final padded data shard
       auto next = std::begin(payload);
-      for (auto x = 0; x < nr_shards; ++x) {
-        shards_p[x] = (uint8_t *) &shards[(x + 1) * prefixsize + x * blocksize];
+      for (auto x = 0; x < aligned_data_shards; ++x) {
+        shards_p[x] = (uint8_t *) next;
+        next += blocksize;
+      }
+      payload_buffers.emplace_back(std::begin(payload), aligned_data_shards * blocksize);
 
+      // If the last data shard needs to be zero-padded, we must use the shards buffer
+      if (pad) {
+        shards_p[aligned_data_shards] = (uint8_t *) &shards[0];
+
+        // GCC doesn't figure out that std::copy_n() can be replaced with memcpy() here
+        // and ends up compiling a horribly slow element-by-element copy loop, so we
+        // help it by using memcpy()/memset() directly.
         auto copy_len = std::min<size_t>(blocksize, std::end(payload) - next);
-        std::copy_n(next, copy_len, shards_p[x]);
+        std::memcpy(shards_p[aligned_data_shards], next, copy_len);
         if (copy_len < blocksize) {
           // Zero any additional space after the end of the payload
-          std::fill_n(shards_p[x] + copy_len, blocksize - copy_len, 0);
+          std::memset(shards_p[aligned_data_shards] + copy_len, 0, blocksize - copy_len);
         }
-
-        next += copy_len;
       }
 
-      if (data_shards + parity_shards <= DATA_SHARDS_MAX) {
+      // Add a payload buffer describing the shard buffer
+      payload_buffers.emplace_back(std::begin(shards), shards.size());
+
+      if (fecpercentage != 0) {
+        // Point into our allocated buffer for the parity shards
+        for (auto x = 0; x < parity_shards; ++x) {
+          shards_p[data_shards + x] = (uint8_t *) &shards[(parity_shard_offset + x) * blocksize];
+        }
+
         // packets = parity_shards + data_shards
         rs_t rs { reed_solomon_new(data_shards, parity_shards) };
 
@@ -704,36 +706,57 @@ namespace stream {
         fecpercentage,
         blocksize,
         prefixsize,
-        std::move(shards)
+        std::move(shards),
+        util::buffer_t<char> { nr_shards * prefixsize },
+        std::move(shards_p),
+        std::move(payload_buffers),
       };
     }
   }  // namespace fec
 
-  template <class F>
+  /**
+   * @brief Combines two buffers and inserts new buffers at each slice boundary of the result.
+   * @param insert_size The number of bytes to insert.
+   * @param slice_size The number of bytes between insertions.
+   * @param data1 The first data buffer.
+   * @param data2 The second data buffer.
+   */
   std::vector<uint8_t>
-  insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data, F &&f) {
-    auto pad = data.size() % slice_size != 0;
-    auto elements = data.size() / slice_size + (pad ? 1 : 0);
+  concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2) {
+    auto data_size = data1.size() + data2.size();
+    auto pad = data_size % slice_size != 0;
+    auto elements = data_size / slice_size + (pad ? 1 : 0);
 
     std::vector<uint8_t> result;
-    result.resize(elements * insert_size + data.size());
+    result.resize(elements * insert_size + data_size);
 
-    auto next = std::begin(data);
-    for (auto x = 0; x < elements - 1; ++x) {
+    auto next = std::begin(data1);
+    auto end = std::end(data1);
+    for (auto x = 0; x < elements; ++x) {
       void *p = &result[x * (insert_size + slice_size)];
 
-      f(p, x, elements);
+      // For the last iteration, only copy to the end of the data
+      if (x == elements - 1) {
+        slice_size = data_size - (x * slice_size);
+      }
 
-      std::copy(next, next + slice_size, (char *) p + insert_size);
-      next += slice_size;
+      // Test if this slice will extend into the next buffer
+      if (next + slice_size > end) {
+        // Copy the first portion from the first buffer
+        auto copy_len = end - next;
+        std::copy(next, end, (char *) p + insert_size);
+
+        // Copy the remaining portion from the second buffer
+        next = std::begin(data2);
+        end = std::end(data2);
+        std::copy(next, next + (slice_size - copy_len), (char *) p + copy_len + insert_size);
+        next += slice_size - copy_len;
+      }
+      else {
+        std::copy(next, next + slice_size, (char *) p + insert_size);
+        next += slice_size;
+      }
     }
-
-    auto x = elements - 1;
-    void *p = &result[x * (insert_size + slice_size)];
-
-    f(p, x, elements);
-
-    std::copy(next, std::end(data), (char *) p + insert_size);
 
     return result;
   }
@@ -741,6 +764,7 @@ namespace stream {
   std::vector<uint8_t>
   replace(const std::string_view &original, const std::string_view &old, const std::string_view &_new) {
     std::vector<uint8_t> replaced;
+    replaced.reserve(original.size() + _new.size() - old.size());
 
     auto begin = std::begin(original);
     auto end = std::end(original);
@@ -1254,13 +1278,28 @@ namespace stream {
     // Video traffic is sent on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
-    stat_trackers::min_max_avg_tracker<uint16_t> frame_processing_latency_tracker;
+    logging::min_max_avg_periodic_logger<double> frame_processing_latency_logger(debug, "Frame processing latency", "ms");
+
+    logging::time_delta_periodic_logger frame_send_batch_latency_logger(debug, "Network: each send_batch() latency");
+    logging::time_delta_periodic_logger frame_fec_latency_logger(debug, "Network: each FEC block latency");
+    logging::time_delta_periodic_logger frame_network_latency_logger(debug, "Network: frame's overall network latency");
+
     crypto::aes_t iv(12);
+
+    auto timer = platf::create_high_precision_timer();
+    if (!timer || !*timer) {
+      BOOST_LOG(error) << "Failed to create timer, aborting video broadcast thread";
+      return;
+    }
+
+    auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
 
     while (auto packet = packets->pop()) {
       if (shutdown_event->peek()) {
         break;
       }
+
+      frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
       auto lowseq = session->video.lowseq;
@@ -1299,78 +1338,96 @@ namespace stream {
         };
 
         uint16_t latency = duration_to_latency(std::chrono::steady_clock::now() - *packet->frame_timestamp);
-
-        if (config::sunshine.min_log_level <= 1) {
-          // Print frame processing latency stats to debug log every 20 seconds
-          auto print_info = [&](uint16_t min_latency, uint16_t max_latency, double avg_latency) {
-            auto f = stat_trackers::one_digit_after_decimal();
-            BOOST_LOG(debug) << "Frame processing latency (min/max/avg): " << f % (min_latency / 10.) << "ms/" << f % (max_latency / 10.) << "ms/" << f % (avg_latency / 10.) << "ms";
-          };
-          frame_processing_latency_tracker.collect_and_callback_on_interval(latency, print_info, 20s);
-        }
-
         frame_header.frame_processing_latency = latency;
+        frame_processing_latency_logger.collect_and_log(latency / 10.);
       }
       else {
         frame_header.frame_processing_latency = 0;
       }
 
-      std::vector<uint8_t> payload_new;
-      std::copy_n((uint8_t *) &frame_header, sizeof(frame_header), std::back_inserter(payload_new));
-      std::copy(std::begin(payload), std::end(payload), std::back_inserter(payload_new));
-
-      payload = { (char *) payload_new.data(), payload_new.size() };
-
-      // insert packet headers
-      auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
-      auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
-
       auto fecPercentage = config::stream.fec_percentage;
 
-      payload_new = insert(sizeof(video_packet_raw_t), payload_blocksize,
-        payload, [&](void *p, int fecIndex, int end) {
-          video_packet_raw_t *video_packet = (video_packet_raw_t *) p;
-
-          video_packet->packet.flags = FLAG_CONTAINS_PIC_DATA;
-        });
+      // Insert space for packet headers
+      auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
+      auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
+      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize,
+        std::string_view { (char *) &frame_header, sizeof(frame_header) }, payload);
 
       payload = std::string_view { (char *) payload_new.data(), payload_new.size() };
 
-      // With a fecpercentage of 255, if payload_new is broken up into more than a 100 data_shards
-      // it will generate greater than DATA_SHARDS_MAX shards.
-      // Therefore, we start breaking the data up into three separate fec blocks.
-      auto multi_fec_threshold = 90 * blocksize;
+      // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
+      constexpr auto MAX_FEC_BLOCKS = 4;
 
-      // We can go up to 4 fec blocks, but 3 is plenty
-      constexpr auto MAX_FEC_BLOCKS = 3;
+      // The max number of data shards per block is found by solving this system of equations for D:
+      // D = 255 - P
+      // P = D * F
+      // which results in the solution:
+      // D = 255 / (1 + F)
+      // multiplied by 100 since F is the percentage as an integer:
+      // D = (255 * 100) / (100 + F)
+      auto max_data_shards_per_fec_block = (DATA_SHARDS_MAX * 100) / (100 + fecPercentage);
+
+      // Compute the number of FEC blocks needed for this frame using the block size and max shards
+      auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
+      auto fec_blocks_needed = (payload.size() + (max_data_per_fec_block - 1)) / max_data_per_fec_block;
+
+      // If the number of FEC blocks needed exceeds the protocol limit, turn off FEC for this frame.
+      // For normal FEC percentages, this should only happen for enormous frames (over 800 packets at 20%).
+      if (fec_blocks_needed > MAX_FEC_BLOCKS) {
+        BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
+        fecPercentage = 0;
+        fec_blocks_needed = MAX_FEC_BLOCKS;
+      }
 
       std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
       decltype(fec_blocks)::iterator
         fec_blocks_begin = std::begin(fec_blocks),
-        fec_blocks_end = std::begin(fec_blocks) + 1;
+        fec_blocks_end = std::begin(fec_blocks) + fec_blocks_needed;
 
-      auto lastBlockIndex = 0;
-      if (payload.size() > multi_fec_threshold) {
-        BOOST_LOG(verbose) << "Generating multiple FEC blocks"sv;
+      BOOST_LOG(verbose) << "Generating "sv << fec_blocks_needed << " FEC blocks"sv;
 
-        // Align individual fec blocks to blocksize
-        auto unaligned_size = payload.size() / MAX_FEC_BLOCKS;
-        auto aligned_size = ((unaligned_size + (blocksize - 1)) / blocksize) * blocksize;
+      // Align individual FEC blocks to blocksize
+      auto unaligned_size = payload.size() / fec_blocks_needed;
+      auto aligned_size = ((unaligned_size + (blocksize - 1)) / blocksize) * blocksize;
 
-        // Break the data up into 3 blocks, each containing multiple complete video packets.
-        fec_blocks[0] = payload.substr(0, aligned_size);
-        fec_blocks[1] = payload.substr(aligned_size, aligned_size);
-        fec_blocks[2] = payload.substr(aligned_size * 2);
-
-        lastBlockIndex = 2 << 6;
-        fec_blocks_end = std::end(fec_blocks);
+      // If we exceed the 10-bit FEC packet index (which means our frame exceeded 4096 packets),
+      // the frame will be unrecoverable. Log an error for this case.
+      if (aligned_size / blocksize >= 1024) {
+        BOOST_LOG(error) << "Encoder produced a frame too large to send! Is the encoder broken? (needed "sv << (aligned_size / blocksize) << " packets)"sv;
       }
-      else {
-        BOOST_LOG(verbose) << "Generating single FEC block"sv;
-        fec_blocks[0] = payload;
+
+      // Split the data into aligned FEC blocks
+      for (int x = 0; x < fec_blocks_needed; ++x) {
+        if (x == fec_blocks_needed - 1) {
+          // The last block must extend to the end of the payload
+          fec_blocks[x] = payload.substr(x * aligned_size);
+        }
+        else {
+          // Earlier blocks just extend to the next block offset
+          fec_blocks[x] = payload.substr(x * aligned_size, aligned_size);
+        }
       }
 
       try {
+        // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
+        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+
+        // Send less than 64K in a single batch.
+        // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
+        // appear in "Other I/O" and begin waiting for interrupts.
+        // This gives inconsistent performance so we'd rather avoid it.
+        size_t send_batch_size = 64 * 1024 / blocksize;
+        // Also don't exceed 64 packets, which can happen when Moonlight requests
+        // unusually small packet size.
+        // Generic Segmentation Offload on Linux can't do more than 64.
+        send_batch_size = std::min<size_t>(64, send_batch_size);
+
+        // Don't ignore the last ratecontrol group of the previous frame
+        auto ratecontrol_frame_start = std::max(ratecontrol_next_frame_start, std::chrono::steady_clock::now());
+
+        size_t ratecontrol_frame_packets_sent = 0;
+        size_t ratecontrol_group_packets_sent = 0;
+
         auto blockIndex = 0;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
           auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
@@ -1383,20 +1440,38 @@ namespace stream {
 
             // Match multiFecFlags with Moonlight
             inspect->packet.multiFecFlags = 0x10;
-            inspect->packet.multiFecBlocks = (blockIndex << 4) | lastBlockIndex;
+            inspect->packet.multiFecBlocks = (blockIndex << 4) | ((fec_blocks_needed - 1) << 6);
 
+            inspect->packet.flags = FLAG_CONTAINS_PIC_DATA;
             if (x == 0) {
               inspect->packet.flags |= FLAG_SOF;
             }
-
             if (x == packets - 1) {
               inspect->packet.flags |= FLAG_EOF;
             }
           }
 
+          frame_fec_latency_logger.first_point_now();
           // If video encryption is enabled, we allocate space for the encryption header before each shard
           auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets,
             session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+          frame_fec_latency_logger.second_point_now_and_log();
+
+          auto peer_address = session->video.peer.address();
+          auto batch_info = platf::batched_send_info_t {
+            shards.headers.begin(),
+            shards.prefixsize,
+            shards.payload_buffers,
+            shards.blocksize,
+            0,
+            0,
+            (uintptr_t) sock.native_handle(),
+            peer_address,
+            session->video.peer.port(),
+            session->localAddress,
+          };
+
+          size_t next_shard_to_send = 0;
 
           // set FEC info now that we know for sure what our percentage will be for this frame
           for (auto x = 0; x < shards.size(); ++x) {
@@ -1415,7 +1490,7 @@ namespace stream {
             inspect->rtp.sequenceNumber = util::endian::big<uint16_t>(lowseq + x);
             inspect->rtp.timestamp = util::endian::big<uint32_t>(timestamp);
 
-            inspect->packet.multiFecBlocks = (blockIndex << 4) | lastBlockIndex;
+            inspect->packet.multiFecBlocks = (blockIndex << 4) | ((fec_blocks_needed - 1) << 6);
             inspect->packet.frameIndex = packet->frame_index();
 
             // Encrypt this shard if video encryption is enabled
@@ -1436,38 +1511,67 @@ namespace stream {
               auto *prefix = (video_packet_enc_prefix_t *) shards.prefix(x);
               prefix->frameNumber = packet->frame_index();
               std::copy(std::begin(iv), std::end(iv), prefix->iv);
-              session->video.cipher->encrypt(std::string_view { (char *) inspect, (size_t) blocksize }, prefix->tag, &iv);
+              session->video.cipher->encrypt(std::string_view { (char *) inspect, (size_t) blocksize },
+                prefix->tag, (uint8_t *) inspect, &iv);
+            }
+
+            if (x - next_shard_to_send + 1 >= send_batch_size ||
+                x + 1 == shards.size()) {
+              // Do pacing within the frame.
+              // Also trigger pacing before the first send_batch() of the frame
+              // to account for the last send_batch() of the previous frame.
+              if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms ||
+                  ratecontrol_frame_packets_sent == 0) {
+                auto due = ratecontrol_frame_start +
+                           std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
+                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+
+                auto now = std::chrono::steady_clock::now();
+                if (now < due) {
+                  timer->sleep_for(due - now);
+                }
+
+                ratecontrol_group_packets_sent = 0;
+              }
+
+              size_t current_batch_size = x - next_shard_to_send + 1;
+              batch_info.block_offset = next_shard_to_send;
+              batch_info.block_count = current_batch_size;
+
+              frame_send_batch_latency_logger.first_point_now();
+              // Use a batched send if it's supported on this platform
+              if (!platf::send_batch(batch_info)) {
+                // Batched send is not available, so send each packet individually
+                BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
+                for (auto y = 0; y < current_batch_size; y++) {
+                  auto send_info = platf::send_info_t {
+                    shards.prefix(next_shard_to_send + y),
+                    shards.prefixsize,
+                    shards.data(next_shard_to_send + y),
+                    shards.blocksize,
+                    (uintptr_t) sock.native_handle(),
+                    peer_address,
+                    session->video.peer.port(),
+                    session->localAddress,
+                  };
+
+                  platf::send(send_info);
+                }
+              }
+              frame_send_batch_latency_logger.second_point_now_and_log();
+
+              ratecontrol_group_packets_sent += current_batch_size;
+              ratecontrol_frame_packets_sent += current_batch_size;
+              next_shard_to_send = x + 1;
             }
           }
 
-          auto peer_address = session->video.peer.address();
-          auto batch_info = platf::batched_send_info_t {
-            shards.shards.begin(),
-            shards.prefixsize + shards.blocksize,
-            shards.nr_shards,
-            (uintptr_t) sock.native_handle(),
-            peer_address,
-            session->video.peer.port(),
-            session->localAddress,
-          };
+          // remember this in case the next frame comes immediately
+          ratecontrol_next_frame_start = ratecontrol_frame_start +
+                                         std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
+                                           ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
 
-          // Use a batched send if it's supported on this platform
-          if (!platf::send_batch(batch_info)) {
-            // Batched send is not available, so send each packet individually
-            BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
-            for (auto x = 0; x < shards.size(); ++x) {
-              auto send_info = platf::send_info_t {
-                shards.prefix(x),
-                shards.prefixsize + shards.blocksize,
-                (uintptr_t) sock.native_handle(),
-                peer_address,
-                session->video.peer.port(),
-                session->localAddress,
-              };
-
-              platf::send(send_info);
-            }
-          }
+          frame_network_latency_logger.second_point_now_and_log();
 
           if (packet->is_idr()) {
             BOOST_LOG(verbose) << "Key Frame ["sv << packet->frame_index() << "] :: send ["sv << shards.size() << "] shards..."sv;
@@ -1496,9 +1600,7 @@ namespace stream {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
 
-    constexpr auto max_block_size = crypto::cipher::round_to_pkcs7_padded(2048);
-
-    audio_packet_t audio_packet { (audio_packet_raw_t *) malloc(sizeof(audio_packet_raw_t) + max_block_size) };
+    audio_packet_t audio_packet;
     fec::rs_t rs { reed_solomon_new(RTPA_DATA_SHARDS, RTPA_FEC_SHARDS) };
     crypto::aes_t iv(16);
 
@@ -1510,9 +1612,9 @@ namespace stream {
     const unsigned char parity[] = { 0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c };
     memcpy(rs.get()->p, parity, sizeof(parity));
 
-    audio_packet->rtp.header = 0x80;
-    audio_packet->rtp.packetType = 97;
-    audio_packet->rtp.ssrc = 0;
+    audio_packet.rtp.header = 0x80;
+    audio_packet.rtp.packetType = 97;
+    audio_packet.rtp.ssrc = 0;
 
     // Audio traffic is sent on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
@@ -1530,26 +1632,28 @@ namespace stream {
 
       *(std::uint32_t *) iv.data() = util::endian::big<std::uint32_t>(session->audio.avRiKeyId + sequenceNumber);
 
-      auto bytes = encode_audio(session->config.encryptionFlagsEnabled & SS_ENC_AUDIO, packet_data, audio_packet, iv, session->audio.cipher);
+      auto &shards_p = session->audio.shards_p;
+
+      auto bytes = encode_audio(session->config.encryptionFlagsEnabled & SS_ENC_AUDIO, packet_data,
+        shards_p[sequenceNumber % RTPA_DATA_SHARDS], iv, session->audio.cipher);
       if (bytes < 0) {
         BOOST_LOG(error) << "Couldn't encode audio packet"sv;
         break;
       }
 
-      audio_packet->rtp.sequenceNumber = util::endian::big(sequenceNumber);
-      audio_packet->rtp.timestamp = util::endian::big(timestamp);
+      audio_packet.rtp.sequenceNumber = util::endian::big(sequenceNumber);
+      audio_packet.rtp.timestamp = util::endian::big(timestamp);
 
       session->audio.sequenceNumber++;
       session->audio.timestamp += session->config.audio.packetDuration;
 
-      auto &shards_p = session->audio.shards_p;
-
-      std::copy_n(audio_packet->payload(), bytes, shards_p[sequenceNumber % RTPA_DATA_SHARDS]);
       auto peer_address = session->audio.peer.address();
       try {
         auto send_info = platf::send_info_t {
-          (const char *) audio_packet.get(),
-          sizeof(audio_packet_raw_t) + bytes,
+          (const char *) &audio_packet,
+          sizeof(audio_packet),
+          (const char *) shards_p[sequenceNumber % RTPA_DATA_SHARDS],
+          (size_t) bytes,
           (uintptr_t) sock.native_handle(),
           peer_address,
           session->audio.peer.port(),
@@ -1561,8 +1665,8 @@ namespace stream {
         auto &fec_packet = session->audio.fec_packet;
         // initialize the FEC header at the beginning of the FEC block
         if (sequenceNumber % RTPA_DATA_SHARDS == 0) {
-          fec_packet->fecHeader.baseSequenceNumber = util::endian::big(sequenceNumber);
-          fec_packet->fecHeader.baseTimestamp = util::endian::big(timestamp);
+          fec_packet.fecHeader.baseSequenceNumber = util::endian::big(sequenceNumber);
+          fec_packet.fecHeader.baseTimestamp = util::endian::big(timestamp);
         }
 
         // generate parity shards at the end of the FEC block
@@ -1570,13 +1674,14 @@ namespace stream {
           reed_solomon_encode(rs.get(), shards_p.begin(), RTPA_TOTAL_SHARDS, bytes);
 
           for (auto x = 0; x < RTPA_FEC_SHARDS; ++x) {
-            fec_packet->rtp.sequenceNumber = util::endian::big<std::uint16_t>(sequenceNumber + x + 1);
-            fec_packet->fecHeader.fecShardIndex = x;
-            memcpy(fec_packet->payload(), shards_p[RTPA_DATA_SHARDS + x], bytes);
+            fec_packet.rtp.sequenceNumber = util::endian::big<std::uint16_t>(sequenceNumber + x + 1);
+            fec_packet.fecHeader.fecShardIndex = x;
 
             auto send_info = platf::send_info_t {
-              (const char *) fec_packet.get(),
-              sizeof(audio_fec_packet_raw_t) + bytes,
+              (const char *) &fec_packet,
+              sizeof(fec_packet),
+              (const char *) shards_p[RTPA_DATA_SHARDS + x],
+              (size_t) bytes,
               (uintptr_t) sock.native_handle(),
               peer_address,
               session->audio.peer.port(),
@@ -1616,6 +1721,14 @@ namespace stream {
       BOOST_LOG(fatal) << "Couldn't open socket for Video server: "sv << ec.message();
 
       return -1;
+    }
+
+    // Set video socket send buffer size (SO_SENDBUF) to 1MB
+    try {
+      ctx.video_sock.set_option(boost::asio::socket_base::send_buffer_size(1024 * 1024));
+    }
+    catch (...) {
+      BOOST_LOG(error) << "Failed to set video socket send buffer size (SO_SENDBUF)";
     }
 
     ctx.video_sock.bind(udp::endpoint(protocol, video_port), ec);
@@ -1934,15 +2047,13 @@ namespace stream {
       session->audio.shards = std::move(shards);
       session->audio.shards_p = std::move(shards_p);
 
-      session->audio.fec_packet.reset((audio_fec_packet_raw_t *) malloc(sizeof(audio_fec_packet_raw_t) + max_block_size));
+      session->audio.fec_packet.rtp.header = 0x80;
+      session->audio.fec_packet.rtp.packetType = 127;
+      session->audio.fec_packet.rtp.timestamp = 0;
+      session->audio.fec_packet.rtp.ssrc = 0;
 
-      session->audio.fec_packet->rtp.header = 0x80;
-      session->audio.fec_packet->rtp.packetType = 127;
-      session->audio.fec_packet->rtp.timestamp = 0;
-      session->audio.fec_packet->rtp.ssrc = 0;
-
-      session->audio.fec_packet->fecHeader.payloadType = 97;
-      session->audio.fec_packet->fecHeader.ssrc = 0;
+      session->audio.fec_packet.fecHeader.payloadType = 97;
+      session->audio.fec_packet.fecHeader.ssrc = 0;
 
       session->audio.cipher = crypto::cipher::cbc_t {
         launch_session.gcm_key, true

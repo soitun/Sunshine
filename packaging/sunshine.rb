@@ -1,6 +1,7 @@
 require "language/node"
 
 class @PROJECT_NAME@ < Formula
+  # conflicts_with "sunshine", because: "sunshine and sunshine-beta cannot be installed at the same time"
   desc "@PROJECT_DESCRIPTION@"
   homepage "@PROJECT_HOMEPAGE_URL@"
   url "@GITHUB_CLONE_URL@",
@@ -37,6 +38,7 @@ class @PROJECT_NAME@ < Formula
   depends_on "icu4c" => :recommended
 
   on_linux do
+    depends_on "avahi"
     depends_on "libcap"
     depends_on "libdrm"
     depends_on "libnotify"
@@ -144,10 +146,9 @@ class @PROJECT_NAME@ < Formula
 
   test do
     # test that the binary runs at all
-    system "#{bin}/sunshine", "--version"
+    system bin/"sunshine", "--version"
 
     # run the test suite
-    # cannot build tests with python tests because homebrew destroys the source directory
-    system "#{bin}/test_sunshine", "--gtest_color=yes"
+    system bin/"test_sunshine", "--gtest_color=yes"
   end
 end

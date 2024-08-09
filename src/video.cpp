@@ -859,6 +859,7 @@ namespace video {
       std::make_optional<encoder_t::option_t>("qp"s, &config::video.qp),
       "h264_vaapi"s,
     },
+    // RC buffer size will be set in platform code if supported
     LIMITED_GOP_SIZE | PARALLEL_ENCODING | SINGLE_SLICE_ONLY | NO_RC_BUF_LIMIT
   };
 #endif
@@ -1610,6 +1611,9 @@ namespace video {
         return nullptr;
       }
 
+      // Allow the encoding device a final opportunity to set/unset or override any options
+      encode_device->init_codec_options(ctx.get(), options);
+
       if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
         char err_str[AV_ERROR_MAX_STRING_SIZE] { 0 };
 
@@ -1721,28 +1725,6 @@ namespace video {
 
   std::unique_ptr<encode_session_t>
   make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
-    if (encode_device) {
-      switch (encode_device->colorspace.colorspace) {
-        case colorspace_e::bt2020:
-          BOOST_LOG(info) << "HDR color coding [Rec. 2020 + SMPTE 2084 PQ]"sv;
-          break;
-
-        case colorspace_e::rec601:
-          BOOST_LOG(info) << "SDR color coding [Rec. 601]"sv;
-          break;
-
-        case colorspace_e::rec709:
-          BOOST_LOG(info) << "SDR color coding [Rec. 709]"sv;
-          break;
-
-        case colorspace_e::bt2020sdr:
-          BOOST_LOG(info) << "SDR color coding [Rec. 2020]"sv;
-          break;
-      }
-      BOOST_LOG(info) << "Color depth: " << encode_device->colorspace.bit_depth << "-bit";
-      BOOST_LOG(info) << "Color range: ["sv << (encode_device->colorspace.full_range ? "JPEG"sv : "MPEG"sv) << ']';
-    }
-
     if (dynamic_cast<platf::avcodec_encode_device_t *>(encode_device.get())) {
       auto avcodec_encode_device = boost::dynamic_pointer_cast<platf::avcodec_encode_device_t>(std::move(encode_device));
       return make_avcodec_encode_session(disp, encoder, config, width, height, std::move(avcodec_encode_device));
@@ -1875,6 +1857,25 @@ namespace video {
 
     auto colorspace = colorspace_from_client_config(config, disp.is_hdr());
     auto pix_fmt = (colorspace.bit_depth == 10) ? encoder.platform_formats->pix_fmt_10bit : encoder.platform_formats->pix_fmt_8bit;
+
+    {
+      auto encoder_name = config.videoFormat == 0 ? encoder.h264.name :
+                          config.videoFormat == 1 ? encoder.hevc.name :
+                          config.videoFormat == 2 ? encoder.av1.name :
+                                                    "unknown";
+
+      BOOST_LOG(info) << "Creating encoder " << logging::bracket(encoder_name);
+
+      auto color_coding = colorspace.colorspace == colorspace_e::bt2020    ? "HDR (Rec. 2020 + SMPTE 2084 PQ)" :
+                          colorspace.colorspace == colorspace_e::rec601    ? "SDR (Rec. 601)" :
+                          colorspace.colorspace == colorspace_e::rec709    ? "SDR (Rec. 709)" :
+                          colorspace.colorspace == colorspace_e::bt2020sdr ? "SDR (Rec. 2020)" :
+                                                                             "unknown";
+
+      BOOST_LOG(info) << "Color coding: " << color_coding;
+      BOOST_LOG(info) << "Color depth: " << colorspace.bit_depth << "-bit";
+      BOOST_LOG(info) << "Color range: " << (colorspace.full_range ? "JPEG" : "MPEG");
+    }
 
     if (dynamic_cast<const encoder_platform_formats_avcodec *>(encoder.platform_formats.get())) {
       result = disp.make_avcodec_encode_device(pix_fmt);

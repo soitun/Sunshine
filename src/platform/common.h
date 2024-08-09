@@ -10,9 +10,10 @@
 #include <mutex>
 #include <string>
 
+#include <boost/core/noncopyable.hpp>
+
 #include "src/config.h"
 #include "src/logging.h"
-#include "src/stat_trackers.h"
 #include "src/thread_safe.h"
 #include "src/utility.h"
 #include "src/video_colorspace.h"
@@ -27,6 +28,8 @@ struct sockaddr;
 struct AVFrame;
 struct AVBufferRef;
 struct AVHWFramesContext;
+struct AVCodecContext;
+struct AVDictionary;
 
 // Forward declarations of boost classes to avoid having to include boost headers
 // here, which results in issues with Windows.h and WinSock2.h include order.
@@ -399,6 +402,13 @@ namespace platf {
     init_hwframes(AVHWFramesContext *frames) {};
 
     /**
+     * @brief Provides a hook for allow platform-specific code to adjust codec options.
+     * @note Implementations may set or modify codec options prior to codec initialization.
+     */
+    virtual void
+    init_codec_options(AVCodecContext *ctx, AVDictionary *options) {};
+
+    /**
      * @brief Prepare to derive a context.
      * @note Implementations may make modifications required before context derivation
      */
@@ -509,25 +519,13 @@ namespace platf {
 
   protected:
     // collect capture timing data (at loglevel debug)
-    stat_trackers::min_max_avg_tracker<double> sleep_overshoot_tracker;
-    void
-    log_sleep_overshoot(std::chrono::nanoseconds overshoot_ns) {
-      if (config::sunshine.min_log_level <= 1) {
-        // Print sleep overshoot stats to debug log every 20 seconds
-        auto print_info = [&](double min_overshoot, double max_overshoot, double avg_overshoot) {
-          auto f = stat_trackers::one_digit_after_decimal();
-          BOOST_LOG(debug) << "Sleep overshoot (min/max/avg): " << f % min_overshoot << "ms/" << f % max_overshoot << "ms/" << f % avg_overshoot << "ms";
-        };
-        // std::chrono::nanoseconds overshoot_ns = std::chrono::steady_clock::now() - next_frame;
-        sleep_overshoot_tracker.collect_and_callback_on_interval(overshoot_ns.count() / 1000000., print_info, 20s);
-      }
-    }
+    logging::time_delta_periodic_logger sleep_overshoot_logger = { debug, "Frame capture sleep overshoot" };
   };
 
   class mic_t {
   public:
     virtual capture_e
-    sample(std::vector<std::int16_t> &frame_buffer) = 0;
+    sample(std::vector<float> &frame_buffer) = 0;
 
     virtual ~mic_t() = default;
   };
@@ -608,22 +606,69 @@ namespace platf {
   void
   restart();
 
-  struct batched_send_info_t {
+  struct buffer_descriptor_t {
     const char *buffer;
-    size_t block_size;
+    size_t size;
+
+    // Constructors required for emplace_back() prior to C++20
+    buffer_descriptor_t(const char *buffer, size_t size):
+        buffer(buffer), size(size) {}
+    buffer_descriptor_t():
+        buffer(nullptr), size(0) {}
+  };
+
+  struct batched_send_info_t {
+    // Optional headers to be prepended to each packet
+    const char *headers;
+    size_t header_size;
+
+    // One or more data buffers to use for the payloads
+    //
+    // NB: Data buffers must be aligned to payload size!
+    std::vector<buffer_descriptor_t> &payload_buffers;
+    size_t payload_size;
+
+    // The offset (in header+payload message blocks) in the header and payload
+    // buffers to begin sending messages from
+    size_t block_offset;
+
+    // The number of header+payload message blocks to send
     size_t block_count;
 
     std::uintptr_t native_socket;
     boost::asio::ip::address &target_address;
     uint16_t target_port;
     boost::asio::ip::address &source_address;
+
+    /**
+     * @brief Returns a payload buffer descriptor for the given payload offset.
+     * @param offset The offset in the total payload data (bytes).
+     * @return Buffer descriptor describing the region at the given offset.
+     */
+    buffer_descriptor_t
+    buffer_for_payload_offset(ptrdiff_t offset) {
+      for (const auto &desc : payload_buffers) {
+        if (offset < desc.size) {
+          return {
+            desc.buffer + offset,
+            desc.size - offset,
+          };
+        }
+        else {
+          offset -= desc.size;
+        }
+      }
+      return {};
+    }
   };
   bool
   send_batch(batched_send_info_t &send_info);
 
   struct send_info_t {
-    const char *buffer;
-    size_t size;
+    const char *header;
+    size_t header_size;
+    const char *payload;
+    size_t payload_size;
 
     std::uintptr_t native_socket;
     boost::asio::ip::address &target_address;
@@ -790,4 +835,30 @@ namespace platf {
    */
   std::vector<supported_gamepad_t> &
   supported_gamepads(input_t *input);
+
+  struct high_precision_timer: private boost::noncopyable {
+    virtual ~high_precision_timer() = default;
+
+    /**
+     * @brief Sleep for the duration
+     * @param duration Sleep duration
+     */
+    virtual void
+    sleep_for(const std::chrono::nanoseconds &duration) = 0;
+
+    /**
+     * @brief Check if platform-specific timer backend has been initialized successfully
+     * @return `true` on success, `false` on error
+     */
+    virtual
+    operator bool() = 0;
+  };
+
+  /**
+   * @brief Create platform-specific timer capable of high-precision sleep
+   * @return A unique pointer to timer
+   */
+  std::unique_ptr<high_precision_timer>
+  create_high_precision_timer();
+
 }  // namespace platf
